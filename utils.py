@@ -1,167 +1,195 @@
 import os
 import tempfile
-import time
-from pathlib import Path
-import subprocess
-import logging
-from genai import GenAI
-from moviepy import VideoFileClip
-
+from functools import lru_cache
 
 from dotenv import load_dotenv
+from genai import GenAI
 
+# MoviePy import (support both old and new versions)
+try:
+    from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip
+except Exception:
+    from moviepy import VideoFileClip, AudioFileClip, CompositeAudioClip  # fallback
+
+
+# Load .env for local development (Streamlit Cloud won't have it, and that's fine)
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ELEVENLABS_API_KEY = os.getenv('ELEVENLABS_API_KEY')
 
-jarvis = GenAI(OPENAI_API_KEY)
-
-
-
-def get_video_duration(video_path):
-    # Load the video file
-    video = VideoFileClip(video_path)
-    
-    # Get the duration in seconds
-    duration_in_seconds = video.duration
-    
-    # Make sure to close the video to free resources
-    video.close()
-    
-    return duration_in_seconds
-
-
-
-def generate_voiceover_text(video_path, instructions):
+def _get_secret(name: str, default=None):
     """
-    Generates an audio narration for a video based on user instructions.
-    
-    Args:
-        video_path (str): Path to the video file
-        instructions (str): User instructions for narration style/content
-    
-    Returns:
-        str: video voiceover text
+    Try Streamlit secrets first (cloud), then fall back to env vars (local/.env).
+    This function avoids hard dependency on streamlit for local scripts.
     """
-    wps = 200/60 #200 words per minute/ 60 seconds
+    value = os.getenv(name, default)
+    try:
+        import streamlit as st
+        value = st.secrets.get(name, value)
+    except Exception:
+        pass
+    return value
+
+
+def _get_openai_api_key() -> str:
+    key = _get_secret("OPENAI_API_KEY")
+    return key
+
+
+@lru_cache(maxsize=1)
+def _jarvis() -> GenAI:
+    """
+    Lazily create and cache the GenAI client.
+    This prevents Streamlit Cloud from crashing at import time.
+    """
+    key = _get_openai_api_key()
+    if not key:
+        raise RuntimeError(
+            "Missing OPENAI_API_KEY. On Streamlit Cloud: add it in App Settings → Secrets as "
+            'OPENAI_API_KEY = "your_key". Locally: set env var or use a .env file.'
+        )
+    return GenAI(key)
+
+
+def get_video_duration(video_path: str) -> float:
+    """Return video duration in seconds."""
+    clip = VideoFileClip(video_path)
+    try:
+        return float(clip.duration)
+    finally:
+        clip.close()
+
+
+def generate_voiceover_text(video_path: str, instructions: str) -> str:
+    """
+    Analyzes a video and generates voiceover text based on user instructions.
+    """
+    wps = 200 / 60  # 200 words per minute / 60 seconds
     duration_secs = get_video_duration(video_path)
-    nwords_max = wps*duration_secs  
-    print(f"\tDuration of video: {duration_secs} seconds")
-    print(f"\tMax words for voiceover: {nwords_max} words")
-    instructions_modified = instructions + f"\nYour voiceover text should be less than {nwords_max} words long."
-    instructions_modified += "Do not use any hashtags or emojis in the voiceover text as this will be read aloud."
-    voiceover_text = jarvis.generate_video_description(video_path, instructions_modified, model='gpt-4o-mini')
+    nwords_max = wps * duration_secs
+
+    instructions_modified = (
+        instructions
+        + f"\nYour voiceover text should be less than {nwords_max:.0f} words long. "
+        + "Do not use any hashtags or emojis in the voiceover text as this will be read aloud."
+    )
+
+    jarvis = _jarvis()
+    voiceover_text = jarvis.generate_video_description(
+        video_path,
+        instructions_modified,
+        model="gpt-4o-mini",
+    )
     return voiceover_text
 
-    
 
-def generate_voiceover_audio(voiceover_text, 
-                             file_path, 
-                            voice_name='nova', 
-                             speed=1.0):
-    complete  = jarvis.generate_audio(voiceover_text,
-                           file_path, 
-                           model='gpt-4o-mini-tts', 
-                           voice=voice_name, 
-                           speed=speed)
-    return complete
+def generate_voiceover_audio(
+    voiceover_text: str,
+    file_path: str,
+    voice_name: str = "nova",
+    speed: float = 1.0,
+):
+    """
+    Converts text to speech and saves as audio file.
+    """
+    jarvis = _jarvis()
+    return jarvis.generate_audio(
+        voiceover_text,
+        file_path,
+        model="gpt-4o-mini-tts",
+        voice=voice_name,
+        speed=speed,
+    )
 
-def merge_video_with_audio(video_path, audio_path, merged_path, video_volume=1.0, audio_volume=1.0):
+
+def _scale_volume(audio_clip, volume: float):
+    """Compatibility helper across MoviePy versions."""
+    if volume == 1.0 or audio_clip is None:
+        return audio_clip
+    if hasattr(audio_clip, "with_volume_scaled"):
+        return audio_clip.with_volume_scaled(volume)  # MoviePy v2+
+    if hasattr(audio_clip, "volumex"):
+        return audio_clip.volumex(volume)  # MoviePy v1
+    return audio_clip
+
+
+def _subclip(audio_clip, t_end: float):
+    """Compatibility helper across MoviePy versions."""
+    if audio_clip is None:
+        return None
+    if hasattr(audio_clip, "subclipped"):
+        return audio_clip.subclipped(0, t_end)  # MoviePy v2+
+    return audio_clip.subclip(0, t_end)  # MoviePy v1
+
+
+def _set_audio(video_clip, audio_clip):
+    """Compatibility helper across MoviePy versions."""
+    if hasattr(video_clip, "with_audio"):
+        return video_clip.with_audio(audio_clip)  # MoviePy v2+
+    return video_clip.set_audio(audio_clip)      # MoviePy v1
+
+
+def merge_video_with_audio(
+    video_path: str,
+    audio_path: str,
+    merged_path: str,
+    video_volume: float = 1.0,
+    audio_volume: float = 1.0,
+) -> str:
     """
-    Merges a video with an audio file and allows controlling both the video and audio volume levels.
-    Uses a version-independent approach that should work with most MoviePy versions.
-    
-    Parameters:
-    ----------
-    video_path : str
-        Path to the input video file.
-    audio_path : str
-        Path to the audio file to be merged with the video.
-    merged_path : str
-        Path where the merged video will be saved.
-    video_volume : float, optional
-        Volume level for the original video audio (default is 1.0, which keeps the original volume).
-        Values greater than 1.0 increase volume, less than 1.0 decrease volume.
-    audio_volume : float, optional
-        Volume level for the added audio track (default is 1.0, which keeps the original volume).
-        Values greater than 1.0 increase volume, less than 1.0 decrease volume.
-        
-    Returns:
-    -------
-    str
-        Path to the merged video file.
+    Combines video with audio file, allowing volume control for both original audio and voiceover.
+    Compatible with MoviePy v1 and v2.
     """
-    import os
-    from moviepy import VideoFileClip, AudioFileClip, CompositeAudioClip
-    
+    # Ensure output directory exists
+    output_dir = os.path.dirname(os.path.abspath(merged_path))
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+    # Use a safe temp audio file in the system temp directory (Streamlit Cloud friendly)
+    tmp_audiofile = os.path.join(tempfile.gettempdir(), "voxover_temp_audio.m4a")
+
+    video_clip = VideoFileClip(video_path)
+    added_audio_clip = AudioFileClip(audio_path)
+
     try:
-        # Load the video
-        video_clip = VideoFileClip(video_path)
-        print(f"Video duration: {video_clip.duration} seconds")
-        
-        # Load the added audio
-        added_audio_clip = AudioFileClip(audio_path)
-        print(f"Added audio duration: {added_audio_clip.duration} seconds")
-        
-        # Adjust video's original audio volume if needed
-        original_audio = None
-        if video_clip.audio is not None:
-            original_audio = video_clip.audio
-            if video_volume != 1.0:
-                original_audio = original_audio.with_volume_scaled(video_volume)
-        
-        # Adjust the added audio volume if needed
-        if audio_volume != 1.0:
-            added_audio_clip = added_audio_clip.with_volume_scaled(audio_volume)
-        
-        # If added audio is longer than video, trim it to match video duration
+        # Adjust volumes
+        original_audio = video_clip.audio
+        original_audio = _scale_volume(original_audio, video_volume)
+        added_audio_clip = _scale_volume(added_audio_clip, audio_volume)
+
+        # Trim added audio if longer than video
         if added_audio_clip.duration > video_clip.duration:
-            added_audio_clip = added_audio_clip.subclipped(0, video_clip.duration)
-        
-        # Create final audio - combine original video audio (if present) with the added audio
+            added_audio_clip = _subclip(added_audio_clip, video_clip.duration)
+
+        # Composite audio
         if original_audio is not None:
-            # If the original audio is shorter than the video, extend it to match
-            if original_audio.duration < video_clip.duration:
-                print(f"Original audio duration ({original_audio.duration}s) is shorter than video ({video_clip.duration}s), extending it")
-                # For simplicity, we'll just use the audio as is and let MoviePy handle potential issues
-            
-            # Create a composite audio from both audio tracks
             final_audio = CompositeAudioClip([original_audio, added_audio_clip])
-            
-            # Create a new video clip without audio and then set the composite audio
-            final_clip = video_clip.with_audio(final_audio)
         else:
-            # If the video has no audio, just use the added audio track
-            final_clip = video_clip.with_audio(added_audio_clip)
-        
-        # Ensure the output directory exists
-        output_dir = os.path.dirname(os.path.abspath(merged_path))
-        if output_dir and not os.path.exists(output_dir):
-            os.makedirs(output_dir, exist_ok=True)
-        
-        # Write the final video to the specified path
+            final_audio = added_audio_clip
+
+        final_clip = _set_audio(video_clip, final_audio)
+
         final_clip.write_videofile(
             merged_path,
-            codec='libx264',
-            audio_codec='aac',
-            temp_audiofile='temp-audio.m4a',
+            codec="libx264",
+            audio_codec="aac",
+            temp_audiofile=tmp_audiofile,
             remove_temp=True,
-            logger=None     # Suppress logger output
+            logger=None,
         )
-        
-        # Close the clips to release resources
-        video_clip.close()
-        added_audio_clip.close()
-        if original_audio is not None:
-            original_audio.close()
-        final_clip.close()
-        
-        print(f"Successfully merged video and audio to: {merged_path}")
+
         return merged_path
-        
-    except Exception as e:
-        print(f"Error merging video and audio: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+
+    finally:
+        # Close resources
+        try:
+            added_audio_clip.close()
+        except Exception:
+            pass
+        try:
+            video_clip.close()
+        except Exception:
+            pass
+        try:
+            final_clip.close()
+        except Exception:
+            pass
